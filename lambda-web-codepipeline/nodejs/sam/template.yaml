@@ -16,6 +16,15 @@ Parameters:
       lambda:InvokeWebFunctionEndpoint. ApplicationManaged makes the endpoint
       PUBLIC and the app owns authentication; the app in src/ has none.
 
+  FunctionTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: >
+      Request timeout in seconds. Applies to the revision this stack creates
+      and to every revision the pipeline creates.
+
   ConnectionArn:
     Type: String
     Description: >
@@ -58,12 +67,23 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !GetAtt ApplicationLogGroup.Arn
+                Resource:
+                  - !GetAtt ApplicationLogGroup.Arn
+                  - !GetAtt ApplicationLocalLogGroup.Arn
 
+  # Execution environments write to the .local group, and Lambda centralizes
+  # those logs into the group without the suffix. Declaring both keeps them in
+  # the stack, so deleting the stack deletes them.
   ApplicationLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/web/${AWS::StackName}
+      RetentionInDays: 7
+
+  ApplicationLocalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/web/${AWS::StackName}.local
       RetentionInDays: 7
 
   # One AWS::Serverless::WebFunction expands into three CloudFormation
@@ -82,7 +102,7 @@ Resources:
       # `sam build` packages src/ for the revision this stack creates (SAM CLI
       # 1.171.0 or later). The pipeline below packages every later revision.
       CodeUri: src/
-      Timeout: 30
+      Timeout: !Ref FunctionTimeout
       AuthType: !Ref EndpointAuthType
       EndpointType: HomeRegion
       # SAM uses this at transform time only, to pin RevisionWeights to the
@@ -267,6 +287,10 @@ Resources:
             Value: prod
           - Name: EXECUTION_ROLE_ARN
             Value: !GetAtt WebFunctionExecutionRole.Arn
+          - Name: TIMEOUT_SECONDS
+            Value: !Ref FunctionTimeout
+          - Name: LOG_GROUP
+            Value: !Ref ApplicationLogGroup
       LogsConfig:
         CloudWatchLogs:
           Status: ENABLED
@@ -279,14 +303,8 @@ Resources:
           phases:
             install:
               commands:
-                # "aws lambda-web" needs AWS CLI v2.37 or later. CodeBuild images
-                # can ship an older version, so update when the command is absent.
-                - |
-                  if ! aws lambda-web help >/dev/null 2>&1; then
-                    curl -sS https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
-                    unzip -q /tmp/awscliv2.zip -d /tmp
-                    /tmp/aws/install --update
-                  fi
+                # "aws lambda-web" needs AWS CLI v2.37 or later, which this
+                # curated image already ships.
                 - aws --version
             build:
               commands:
@@ -309,7 +327,7 @@ Resources:
                     --function-name "$FUNCTION_ARN" \
                     --description "commit ${CODEBUILD_RESOLVED_SOURCE_VERSION}" \
                     --build-config "codeConfig={s3Object={bucket=$CODE_BUCKET,key=$KEY,versionId=$VERSION_ID}},runtimeConfig={runtime=nodejs24.x}" \
-                    --service-config "executionRoleArn=$EXECUTION_ROLE_ARN,timeoutSeconds=30,environmentVariables={APP_COMMIT=$CODEBUILD_RESOLVED_SOURCE_VERSION}" \
+                    --service-config "executionRoleArn=$EXECUTION_ROLE_ARN,timeoutSeconds=$TIMEOUT_SECONDS,environmentVariables={APP_COMMIT=$CODEBUILD_RESOLVED_SOURCE_VERSION},telemetryConfig={loggingConfig={logGroup=$LOG_GROUP}}" \
                     --query revisionId --output text)
                   echo "created revision $REVISION_ID"
 
@@ -374,6 +392,7 @@ Resources:
     DependsOn: CodeBucketPolicy
     Properties:
       RoleArn: !GetAtt PipelineRole.Arn
+      PipelineType: V2
       ArtifactStore:
         Type: S3
         Location: !Ref ArtifactBucket

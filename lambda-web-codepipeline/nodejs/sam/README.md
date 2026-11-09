@@ -33,7 +33,7 @@ Important: this application uses various AWS services and there are costs associ
     (cd /path/to/your-repo && git add index.js package.json \
       && git commit -m "Add web function app" && git push)
     ```
-1. Create an AWS CodeConnections connection to GitHub. CloudFormation cannot create one because it needs a browser handshake, and a connection left in `PENDING` will not work:
+1. Create an AWS CodeConnections connection to GitHub. AWS CloudFormation cannot create one because it needs a browser handshake, and a connection left in `PENDING` will not work:
     ```bash
     export AWS_REGION=<< AWS Region >>
     export STACK=lambda-web-codepipeline
@@ -80,7 +80,7 @@ Important: this application uses various AWS services and there are costs associ
 
 Two behaviours to know before building on this:
 
-* **A stack update can take traffic back.** The endpoint's weights are declared as the revision the stack creates. Changing anything that makes CloudFormation create a new revision, such as `Timeout`, also resets the endpoint to it, and the pipeline's release stops serving traffic until the pipeline runs again.
+* **A stack update can take traffic back.** The endpoint's weights are declared as the revision the stack creates. Changing anything that makes CloudFormation create a new revision, such as `FunctionTimeout`, also resets the endpoint to it, and the pipeline's release stops serving traffic until the pipeline runs again.
 * **Lambda cleans up old revisions.** 50 revisions per function is an automatic cleanup target, not a hard cap. Lambda deletes the oldest revisions that no endpoint routes to, which can include a rollback target you have removed from all weights. See [Revision limits and automatic cleanup](https://docs.aws.amazon.com/lambda/latest/dg/web-functions-revisions.html).
 
 ## Testing
@@ -101,9 +101,10 @@ curl -s -o /dev/null -w "%{http_code}\n" https://$ENDPOINT/
 # 403
 ```
 
-Sign the request with SigV4, using service name `lambda`. Drop the `x-amz-security-token` header if you use long-term credentials:
+Sign the request with SigV4, using service name `lambda`. The first command exports the credentials of your current AWS CLI profile or session as environment variables. Drop the `x-amz-security-token` header if you use long-term credentials:
 
 ```bash
+eval "$(aws configure export-credentials --format env)"
 curl -s --aws-sigv4 "aws:amz:$AWS_REGION:lambda" \
   --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
   -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
