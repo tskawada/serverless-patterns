@@ -1,0 +1,437 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless patterns - Continuous deployment for AWS Lambda Web Functions with
+  AWS CodePipeline (SAM). A push to a branch builds, uploads and releases a revision.
+
+Parameters:
+  EndpointAuthType:
+    Type: String
+    Default: IamAuth
+    AllowedValues:
+      - IamAuth
+      - ApplicationManaged
+    Description: >
+      IamAuth requires SigV4-signed requests from a caller holding
+      lambda:InvokeWebFunctionEndpoint. ApplicationManaged makes the endpoint
+      PUBLIC and the app owns authentication; the app in src/ has none.
+
+  ConnectionArn:
+    Type: String
+    Description: >
+      ARN of an existing AWS CodeConnections connection to GitHub, in Available
+      status. CloudFormation cannot create one; it needs a browser handshake.
+
+  RepositoryId:
+    Type: String
+    Description: Source repository holding the application, in owner/name form.
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: Branch that the pipeline tracks.
+
+Resources:
+  # --------------------------------------------------------------------------
+  # Lambda Web Function
+  # --------------------------------------------------------------------------
+
+  # Declared explicitly rather than letting SAM generate it, because the
+  # pipeline has to pass this role to every revision it creates and therefore
+  # needs its ARN.
+  WebFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteApplicationLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ApplicationLogGroup.Arn
+
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/web/${AWS::StackName}
+      RetentionInDays: 7
+
+  # One AWS::Serverless::WebFunction expands into three CloudFormation
+  # resources: AWS::Lambda::WebFunction (the function), an immutable
+  # AWS::Lambda::WebFunctionRevision (code plus configuration) and
+  # AWS::Lambda::WebFunctionEndpoint (the HTTPS endpoint). The generated
+  # endpoint takes the logical ID of the function with "Endpoint" appended.
+  WebFunction:
+    Type: AWS::Serverless::WebFunction
+    Properties:
+      # Named after the stack so the README commands can refer to it. Names
+      # are unique across all Regions in an account.
+      FunctionName: !Ref AWS::StackName
+      EndpointName: prod
+      Runtime: nodejs24.x
+      # `sam build` packages src/ for the revision this stack creates (SAM CLI
+      # 1.171.0 or later). The pipeline below packages every later revision.
+      CodeUri: src/
+      Timeout: 30
+      AuthType: !Ref EndpointAuthType
+      EndpointType: HomeRegion
+      # SAM uses this at transform time only, to pin RevisionWeights to the
+      # revision this stack creates. AWS::Lambda::WebFunctionEndpoint has no
+      # auto-deployment property, so the deployed endpoint takes the API
+      # default of Disabled and the build below has to move the weights.
+      AutoDeploymentMode: LatestRevision
+      ExecutionRoleArn: !GetAtt WebFunctionExecutionRole.Arn
+      EnvironmentVariables:
+        APP_COMMIT: seed
+      LoggingConfig:
+        LogGroup: !Ref ApplicationLogGroup
+
+  # --------------------------------------------------------------------------
+  # Pipeline
+  # --------------------------------------------------------------------------
+
+  # Holds one zip per commit. Revisions read their code from here for as long
+  # as they exist, so the bucket is versioned and readable by Lambda.
+  CodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRevisionsToReadCode
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub ${CodeBucket.Arn}/*
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub ${WebFunction.FunctionArn}/revision/*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt CodeBucket.Arn
+              - !Sub ${CodeBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildAndRelease
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Sid: ReadSourceArtifact
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Sid: ReadWriteDeploymentPackage
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  # CreateWebFunctionRevision checks that the caller can read
+                  # the object it references, not only write it.
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${CodeBucket.Arn}/*
+              - Sid: CreateRevision
+                Effect: Allow
+                Action: lambda:CreateWebFunctionRevision
+                Resource: !GetAtt WebFunction.FunctionArn
+              # The waiters used in the build poll these two read operations.
+              - Sid: ReadRevisionAndEndpointState
+                Effect: Allow
+                Action:
+                  - lambda:GetWebFunctionRevision
+                  - lambda:GetWebFunctionEndpoint
+                Resource:
+                  - !Sub ${WebFunction.FunctionArn}/revision/*
+                  - !GetAtt WebFunctionEndpoint.EndpointArn
+              - Sid: ShiftTraffic
+                Effect: Allow
+                Action: lambda:UpdateWebFunctionEndpoint
+                Resource: !GetAtt WebFunctionEndpoint.EndpointArn
+              - Sid: PassExecutionRoleToRevision
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt WebFunctionExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+
+  # Declared so that deleting the stack also deletes the build logs.
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${AWS::StackName}-build
+      RetentionInDays: 7
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !GetAtt BuildProjectRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: CODE_BUCKET
+            Value: !Ref CodeBucket
+          - Name: FUNCTION_ARN
+            Value: !GetAtt WebFunction.FunctionArn
+          - Name: ENDPOINT_NAME
+            Value: prod
+          - Name: EXECUTION_ROLE_ARN
+            Value: !GetAtt WebFunctionExecutionRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              commands:
+                # "aws lambda-web" needs AWS CLI v2.37 or later. CodeBuild images
+                # can ship an older version, so update when the command is absent.
+                - |
+                  if ! aws lambda-web help >/dev/null 2>&1; then
+                    curl -sS https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+                    unzip -q /tmp/awscliv2.zip -d /tmp
+                    /tmp/aws/install --update
+                  fi
+                - aws --version
+            build:
+              commands:
+                # The sample app has no dependencies. If yours does, add a
+                # runtime-versions block and run "npm ci --omit=dev" here.
+                - zip -qr /tmp/function.zip . -x '.git/*'
+                - |
+                  KEY="${CODEBUILD_RESOLVED_SOURCE_VERSION}.zip"
+
+                  # Versioning is on, so put-object returns a VersionId.
+                  # Pinning the revision to it makes the artifact immutable.
+                  VERSION_ID=$(aws s3api put-object \
+                    --bucket "$CODE_BUCKET" \
+                    --key "$KEY" \
+                    --body /tmp/function.zip \
+                    --query VersionId --output text)
+                  echo "uploaded s3://$CODE_BUCKET/$KEY version $VERSION_ID"
+
+                  REVISION_ID=$(aws lambda-web create-web-function-revision \
+                    --function-name "$FUNCTION_ARN" \
+                    --description "commit ${CODEBUILD_RESOLVED_SOURCE_VERSION}" \
+                    --build-config "codeConfig={s3Object={bucket=$CODE_BUCKET,key=$KEY,versionId=$VERSION_ID}},runtimeConfig={runtime=nodejs24.x}" \
+                    --service-config "executionRoleArn=$EXECUTION_ROLE_ARN,timeoutSeconds=30,environmentVariables={APP_COMMIT=$CODEBUILD_RESOLVED_SOURCE_VERSION}" \
+                    --query revisionId --output text)
+                  echo "created revision $REVISION_ID"
+
+                  # An endpoint cannot route to a revision until it is Active.
+                  aws lambda-web wait web-function-revision-active \
+                    --function-name "$FUNCTION_ARN" --revision-id "$REVISION_ID"
+
+                  # The endpoint is in Disabled mode, so this releases the
+                  # build. One entry at 100 replaces what was serving before.
+                  aws lambda-web update-web-function-endpoint \
+                    --function-name "$FUNCTION_ARN" \
+                    --endpoint-name "$ENDPOINT_NAME" \
+                    --revision-weights "revisionId=$REVISION_ID,weight=100"
+
+                  aws lambda-web wait web-function-endpoint-updated \
+                    --function-name "$FUNCTION_ARN" --endpoint-name "$ENDPOINT_NAME"
+                  echo "endpoint now serves $REVISION_ID"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StoreArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Sid: ReadArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketVersioning
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: ReadSourceRepository
+                Effect: Allow
+                # The action's service prefix must match the connection ARN's.
+                # Connections created today are arn:aws:codeconnections:...
+                Action: codeconnections:UseConnection
+                Resource: !Ref ConnectionArn
+              - Sid: StartBuild
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt BuildProject.Arn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    # The pipeline runs once on creation, and Lambda must already be able to
+    # read the package that run uploads.
+    DependsOn: CodeBucketPolicy
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref RepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: true
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: Source
+        - Name: Build
+          Actions:
+            - Name: PackageAndRelease
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: Source
+
+Outputs:
+  EndpointDomainName:
+    Description: HTTPS domain of the Lambda Web Function endpoint
+    Value: !GetAtt WebFunctionEndpoint.DomainName
+
+  EndpointAuthType:
+    Description: How the endpoint authorizes requests
+    Value: !Ref EndpointAuthType
+
+  FunctionArn:
+    Description: ARN of the Lambda Web Function
+    Value: !GetAtt WebFunction.FunctionArn
+
+  PipelineName:
+    Description: Name of the pipeline that releases each commit
+    Value: !Ref Pipeline
+
+  CodeBucketName:
+    Description: Deployment package bucket, which must be emptied before stack deletion
+    Value: !Ref CodeBucket
+
+  ArtifactBucketName:
+    Description: Pipeline artifact bucket, which must be emptied before stack deletion
+    Value: !Ref ArtifactBucket
+
+  LogGroupName:
+    Description: CloudWatch Logs group the web function writes to
+    Value: !Ref ApplicationLogGroup

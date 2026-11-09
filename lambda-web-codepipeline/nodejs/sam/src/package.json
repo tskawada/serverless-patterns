@@ -1,0 +1,13 @@
+{
+  "name": "lambda-web-codepipeline",
+  "version": "1.0.0",
+  "description": "Sample app deployed to an AWS Lambda Web Function by AWS CodePipeline",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
